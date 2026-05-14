@@ -55,7 +55,7 @@ impl<'a> EventData<'a> {
     pub fn format(&self) -> &EventFormat { self.format }
 }
 
-type BoxedCallback = Box<dyn FnMut(&EventData) -> anyhow::Result<()>>;
+pub(crate) type BoxedCallback = Box<dyn FnMut(&EventData) -> anyhow::Result<()>>;
 
 /// `DataFieldRef` is a wrapper for a `DataField` contained in a `Cell`, wrapped in a `Rc`.
 /// This allows the `DataField` to be shared and updated across multiple consumers.

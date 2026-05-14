@@ -15,6 +15,7 @@ use crate::Guid;
 #[allow(dead_code)]
 mod abi;
 mod events;
+mod tdh;
 
 use abi::{
     TraceSession,
@@ -23,6 +24,10 @@ use abi::{
     EVENT_HEADER_EXTENDED_DATA_ITEM,
     CLASSIC_EVENT_ID,
 };
+
+use tdh::TdhSchemaCache;
+
+use crate::event::BoxedCallback;
 
 pub const PROPERTY_ENABLE_KEYWORD_0: u32 = abi::EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0;
 pub const PROPERTY_ENABLE_SILOS: u32 = abi::EVENT_ENABLE_PROPERTY_ENABLE_SILOS;
@@ -221,6 +226,9 @@ type EventLookup = HashMap<usize, Vec<Event>, BuildHasherDefault<XxHash64>>;
 struct ProviderEvents {
     use_op_id: bool,
     events: EventLookup,
+    /// Callbacks registered against this provider for TDH-based dynamic
+    /// decoding. Empty for providers that only have static events.
+    dynamic_callbacks: Vec<BoxedCallback>,
 }
 
 impl ProviderEvents {
@@ -228,6 +236,7 @@ impl ProviderEvents {
         Self {
             use_op_id: false,
             events: HashMap::default(),
+            dynamic_callbacks: Vec::new(),
         }
     }
 
@@ -476,6 +485,43 @@ impl EtwSession {
         &mut self,
         event: &Event) -> &mut TraceEnable {
         self.enable_provider(*event.extension().provider())
+    }
+
+    /// Registers a provider for dynamic TDH-based event decoding.
+    ///
+    /// Events from this provider are decoded via `TdhGetEventInformation`
+    /// on the first occurrence of each unique schema; subsequent events
+    /// with the same schema reuse a cached `EventFormat`. The supplied
+    /// callback receives the standard `EventData` — the same type used by
+    /// statically registered events.
+    ///
+    /// This is the entry point for TraceLogging and TraceLoggingDynamic
+    /// events whose field layout is not known at compile time. Multiple
+    /// callbacks may be registered against the same provider; each will be
+    /// invoked for every decoded event from that provider. Static events
+    /// registered separately for the same provider take precedence — only
+    /// events whose `Id` is not registered as a static event are routed to
+    /// the dynamic callbacks.
+    pub fn add_dynamic_provider(
+        &mut self,
+        provider: Guid,
+        level: u8,
+        keyword: u64,
+        callback: impl FnMut(&EventData) -> anyhow::Result<()> + 'static) {
+        let enabler = self.enable_provider(provider);
+
+        enabler.ensure_level(level);
+        enabler.ensure_keyword(keyword);
+        /* Dynamic providers accept all event IDs from the provider; an event
+         * ID filter cannot be built upfront because the set of IDs is
+         * unknown. */
+        enabler.ensure_no_filtering();
+
+        let provider_events = self.providers
+            .entry(provider)
+            .or_insert_with(ProviderEvents::new);
+
+        provider_events.dynamic_callbacks.push(Box::new(callback));
     }
 
     fn provider_events_mut(
@@ -1149,19 +1195,23 @@ impl EtwSession {
         let has_pid_filter = !pid_lookup.is_empty();
         let has_cpu_filter = target_cpus.is_some();
 
+        /* TDH schema cache for dynamic providers. Lives on the single ETW
+         * processing thread so requires no synchronization. */
+        let mut tdh_cache = TdhSchemaCache::new();
+
         let result = session.process(Box::new(move |event| {
             let cpu_index = event.ProcessorIndex;
 
             /* Find events by provider ID */
-            if let Some(events) = events.get_mut(&event.EventHeader.ProviderId) {
+            if let Some(provider_events) = events.get_mut(&event.EventHeader.ProviderId) {
                 /* Determine which ID for lookup */
-                let id: usize = match events.use_op_id() {
+                let id: usize = match provider_events.use_op_id() {
                     true => { event.EventHeader.EventDescriptor.Opcode.into() },
                     false => { event.EventHeader.EventDescriptor.Id.into() },
                 };
 
                 /* Find any registered closures for the event */
-                if let Some(events) = events.get_events_mut_if_exist(id) {
+                if let Some(events) = provider_events.get_events_mut_if_exist(id) {
                     /* Update ancillary data */
                     ancillary.borrow_mut().event = Some(event);
 
@@ -1214,6 +1264,45 @@ impl EtwSession {
 
                     /* Clear ancillary data */
                     ancillary.borrow_mut().event = None;
+                } else if !provider_events.dynamic_callbacks.is_empty() {
+                    /*
+                     * Dynamic TDH decode path:
+                     *
+                     * The provider has no static event registered for this
+                     * Id, but the user registered the provider for dynamic
+                     * TDH-based decoding. Look up (or build) the schema by
+                     * the event's schema TL bytes and dispatch to all
+                     * dynamic callbacks against the cached EventFormat.
+                     */
+                    if has_cpu_filter {
+                        /* Honor CPU filtering for dynamic providers as well. */
+                        if let Some(target_cpus) = &target_cpus {
+                            if !target_cpus.contains(&cpu_index) {
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Some(cached) = tdh_cache.lookup_or_insert(event) {
+                        ancillary.borrow_mut().event = Some(event);
+
+                        let slice = event.user_data_slice();
+                        let data = EventData::new(slice, slice, &cached.format);
+
+                        for cb in &mut provider_events.dynamic_callbacks {
+                            if let Err(e) = cb(&data) {
+                                if let Some(callback) = &error_callback {
+                                    callback(&cached.event, &e);
+                                } else {
+                                    eprintln!(
+                                        "Error: Event '{}': {}",
+                                        cached.event_name, e);
+                                }
+                            }
+                        }
+
+                        ancillary.borrow_mut().event = None;
+                    }
                 }
             }
         }));
