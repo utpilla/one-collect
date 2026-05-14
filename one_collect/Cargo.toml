@@ -23,6 +23,10 @@ tracing = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55.0"
+# Pinned to 0.59 to lockstep with the version winreg 0.55 pulls in transitively.
+# Pre-1.0 windows-sys releases are semver-incompatible, and Cargo will compile
+# both versions side-by-side if they drift, doubling FFI build time.
+windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Etw"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.153"

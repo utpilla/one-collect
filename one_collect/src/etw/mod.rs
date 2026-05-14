@@ -15,14 +15,16 @@ use crate::Guid;
 #[allow(dead_code)]
 mod abi;
 mod events;
+pub mod tdh;
 
 use abi::{
     TraceSession,
     TraceEnable,
-    EVENT_RECORD,
     EVENT_HEADER_EXTENDED_DATA_ITEM,
     CLASSIC_EVENT_ID,
 };
+
+pub use abi::EVENT_RECORD;
 
 pub const PROPERTY_ENABLE_KEYWORD_0: u32 = abi::EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0;
 pub const PROPERTY_ENABLE_SILOS: u32 = abi::EVENT_ENABLE_PROPERTY_ENABLE_SILOS;
@@ -147,6 +149,18 @@ impl AncillaryData {
             },
             None => { 0 },
         }
+    }
+
+    /// Returns the raw `EVENT_RECORD` for the event currently being
+    /// dispatched, if any.
+    ///
+    /// The returned reference is valid only for the duration of the current
+    /// callback invocation; callers must not retain it past callback return.
+    /// Intended for advanced consumers (for example a `TdhManifestSource`
+    /// performing TDH-based dynamic decoding) that need direct access to the
+    /// raw record bytes.
+    pub fn record(&self) -> Option<&EVENT_RECORD> {
+        self.event.map(|p| unsafe { &*p })
     }
 
     pub fn callstack(
