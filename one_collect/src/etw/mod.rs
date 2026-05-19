@@ -156,7 +156,7 @@ impl AncillaryData {
     ///
     /// The returned reference is valid only for the duration of the current
     /// callback invocation; callers must not retain it past callback return.
-    /// Intended for advanced consumers (for example a `TdhManifestSource`
+    /// Intended for advanced consumers (for example a `TdhDecoder`
     /// performing TDH-based dynamic decoding) that need direct access to the
     /// raw record bytes.
     pub fn record(&self) -> Option<&EVENT_RECORD> {

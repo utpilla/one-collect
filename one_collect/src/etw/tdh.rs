@@ -3,15 +3,16 @@
 
 //! TDH-based dynamic ETW event decoding.
 //!
-//! [`TdhManifestSource`] turns a raw ETW [`EVENT_RECORD`] into a
-//! [`DecodedEvent`] whose fields can be queried by name or index. The TDH
-//! schema for each unique event identity is cached on first sighting so
-//! subsequent events of the same shape skip the `TdhGetEventInformation`
-//! call entirely.
+//! [`TdhDecoder`] is a standalone, composable decoder for ETW events
+//! whose schema is delivered through TDH (TraceLogging events and, later,
+//! manifested ETW providers). The schema for each unique event identity is
+//! cached on first sighting; on every subsequent event the decoder returns
+//! an [`EventData`] over the cached [`EventFormat`] so consumers can use
+//! all of the existing `EventFormat::get_field` /
+//! `try_get_field_data_closure` / scripting / filter machinery the
+//! framework already provides for static events.
 //!
-//! `TdhManifestSource` is a standalone, composable decoder. It does not
-//! register itself with [`EtwSession`](crate::etw::EtwSession); a typical
-//! consumer:
+//! A typical consumer:
 //!
 //! 1. Builds a wildcard [`Event`](crate::event::Event) for the provider
 //!    via [`Event::set_id_wild_card_flag`](crate::event::Event::set_id_wild_card_flag),
@@ -19,32 +20,35 @@
 //!    [`WindowsEventExtension`](crate::event::os::windows::WindowsEventExtension),
 //!    and registers it with the session via the standard
 //!    [`EtwSession::add_event`](crate::etw::EtwSession::add_event).
-//! 2. Owns a `TdhManifestSource` inside the registered callback.
+//! 2. Owns a `TdhDecoder` inside the registered callback.
 //! 3. On each event, retrieves the raw record via
 //!    [`AncillaryData::record`](crate::etw::AncillaryData::record) and
-//!    calls [`decode`](TdhManifestSource::decode) to obtain a
-//!    [`DecodedEvent`].
+//!    calls [`decode`](TdhDecoder::decode) to obtain an
+//!    [`EventData`].
 //!
-//! ## Scope of this prototype
+//! ## Scope
 //!
-//! Per-event field-offset resolution is implemented for the property
-//! shapes most commonly used by manifested ETW providers and TraceLogging:
+//! The decoder maps TDH `EVENT_PROPERTY_INFO` entries onto the existing
+//! [`EventField`] / [`LocationType`] model:
 //!
-//! * Fixed-width scalar types (integers, floats, GUID, FILETIME,
-//!   SYSTEMTIME, pointer in either 4- or 8-byte width).
-//! * NUL-terminated UTF-16 (`UnicodeString`) and ANSI (`AnsiString`)
-//!   strings.
-//! * Counted strings (`COUNTEDSTRING`, `COUNTEDANSISTRING`) and counted
-//!   binary (`MANIFEST_COUNTEDBINARY`).
-//! * `SID` (variable length, sized from the `SubAuthorityCount` byte).
-//! * Length-from-another-property via the
-//!   [`PropertyParamLength`](ws_etw::PropertyParamLength) flag.
+//! * Fixed-width scalars (integers, floats, GUID, FILETIME, SYSTEMTIME,
+//!   pointer in either 4- or 8-byte width) become `LocationType::Static`.
+//! * `UnicodeString` / `AnsiString` become `LocationType::StaticUTF16String`
+//!   / `LocationType::StaticString`.
+//! * `COUNTEDSTRING` / `COUNTEDANSISTRING` become
+//!   `LocationType::StaticLenPrefixArray` of `u8`.
+//! * `PropertyStruct` entries are flattened recursively with dot-notation
+//!   field names.
 //!
-//! Anything beyond a single occurrence of these — array properties,
-//! struct properties, custom-schema properties — causes decoding to halt
-//! at that field. The properties already resolved before the unsupported
-//! one are still queryable; the rest report
-//! [`FieldStatus::Unresolved`].
+//! Property shapes the existing `LocationType` model cannot express
+//! today — `PropertyParamLength`, `PropertyParamCount`,
+//! `PropertyParamFixedCount`, fixed arrays with `count > 1`, `SID`,
+//! `Binary` — are emitted as zero-length `Static` placeholder fields so
+//! the schema is still cached and the rest of the event stream continues
+//! to flow. Consumers will see an empty slice for those, and (because the
+//! skip-chain does not know how to advance past them) for any subsequent
+//! fields. Lifting that limitation will require extending the framework
+//! with new `LocationType` variants when we add manifest support.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -54,6 +58,7 @@ use twox_hash::XxHash64;
 use windows_sys::Win32::System::Diagnostics::Etw as ws_etw;
 
 use crate::Guid;
+use crate::event::{EventData, EventField, EventFormat, LocationType};
 
 use super::EVENT_RECORD;
 
@@ -83,62 +88,11 @@ struct CacheKey {
     pointer_size: u8,
 }
 
-type SchemaCache = HashMap<CacheKey, CachedSchema, BuildHasherDefault<XxHash64>>;
-
-/// Parsed per-property descriptor cached from `TRACE_EVENT_INFO`.
-#[derive(Clone)]
-struct PropertyDescriptor {
-    name: String,
-    in_type: u16,
-    out_type: u16,
-    flags: i32,
-    /// Array count (or `1` for a single value).
-    count: CountSpec,
-    /// How to determine the byte length of a single occurrence.
-    length: LengthSpec,
-    /// `true` if the property is a `PropertyStruct` (struct member group);
-    /// not handled in this prototype.
-    is_struct: bool,
-}
-
-/// How to determine the array element count of a property.
-#[derive(Clone)]
-enum CountSpec {
-    /// Single occurrence (most properties).
-    Single,
-    /// Fixed array length from the schema.
-    Fixed(u16),
-    /// Length given by another property's value (index into the
-    /// top-level property array).
-    FromPropertyIndex(u16),
-}
-
-/// How to determine the byte length of one occurrence of a property.
-#[derive(Clone)]
-enum LengthSpec {
-    /// Length is fixed and known from `InType` (e.g. `UInt32` = 4).
-    Fixed(u16),
-    /// Length, in characters or bytes per `InType`, comes from another
-    /// property's resolved value.
-    FromPropertyIndex(u16),
-    /// NUL-terminated string (UTF-16 or ANSI).
-    NulTerminated,
-    /// `SID` — first byte is `Revision`, second is `SubAuthorityCount`,
-    /// total length = `8 + 4 * SubAuthorityCount`.
-    Sid,
-    /// Length-prefixed by a `u16` count of bytes
-    /// (`COUNTEDSTRING`, `COUNTEDANSISTRING`, `MANIFEST_COUNTEDBINARY`,
-    /// etc.).
-    CountedU16Prefix,
-    /// We do not know how to size this property; decoding cannot continue
-    /// past it.
-    Unsupported,
-}
-
 struct CachedSchema {
-    pointer_size: u8,
-    properties: Vec<PropertyDescriptor>,
+    format: EventFormat,
 }
+
+type SchemaCache = HashMap<CacheKey, CachedSchema, BuildHasherDefault<XxHash64>>;
 
 /// Errors that may surface from a TDH decode attempt.
 #[derive(Debug)]
@@ -174,51 +128,32 @@ impl std::fmt::Display for TdhDecodeError {
 impl std::error::Error for TdhDecodeError {}
 
 /// Standalone, cacheable decoder for ETW events whose schema is delivered
-/// via TDH (manifested providers, TraceLogging).
+/// via TDH.
 ///
-/// Memory grows roughly proportionally to the number of unique
-/// `(provider, event id, version, opcode, channel, keyword, pointer_size)`
-/// tuples observed.
-pub struct TdhManifestSource {
+/// `TdhDecoder` does not register itself with
+/// [`EtwSession`](crate::etw::EtwSession); the user is expected to move it
+/// into a per-provider wildcard event callback and call
+/// [`decode`](Self::decode) on each delivery.
+pub struct TdhDecoder {
     cache: SchemaCache,
-    /// Reusable buffer for `TdhGetEventInformation`.
+    /// Reusable buffer for `TdhGetEventInformation`. Sized large enough to
+    /// hold the most recent schema; subsequent decodes reuse the
+    /// allocation.
     scratch: Vec<u8>,
-    /// Reusable per-event field-resolution buffer (start, end, status).
-    resolved: Vec<ResolvedField>,
 }
 
-#[derive(Clone, Copy)]
-struct ResolvedField {
-    start: u32,
-    end: u32,
-    status: FieldStatus,
-}
-
-/// Per-field resolution result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FieldStatus {
-    /// Field offset and length resolved successfully.
-    Resolved,
-    /// Field is downstream of a property whose layout we could not resolve.
-    Unresolved,
-    /// Field is present in the schema but extends past the end of the
-    /// event's UserData payload.
-    Truncated,
-}
-
-impl Default for TdhManifestSource {
+impl Default for TdhDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TdhManifestSource {
-    /// Creates an empty `TdhManifestSource` with no cached schemas.
+impl TdhDecoder {
+    /// Creates an empty `TdhDecoder` with no cached schemas.
     pub fn new() -> Self {
         Self {
             cache: HashMap::default(),
             scratch: Vec::new(),
-            resolved: Vec::new(),
         }
     }
 
@@ -227,16 +162,18 @@ impl TdhManifestSource {
         self.cache.len()
     }
 
-    /// Decodes the given event record, returning a [`DecodedEvent`] borrowing
-    /// from `self` and `record`.
+    /// Decodes the given event record, returning an [`EventData`] borrowing
+    /// from both `self` (for the cached [`EventFormat`]) and `record`
+    /// (for the raw user-data slice).
     ///
-    /// On a cache hit this only walks the record's `UserData` to compute
-    /// per-field offsets. On a miss it additionally invokes
-    /// `TdhGetEventInformation` (twice — probe then populate), parses
-    /// `TRACE_EVENT_INFO`, and inserts a [`CachedSchema`] before walking.
+    /// On a cache hit this is a HashMap lookup; the `EventData` is then
+    /// constructed by reusing the cached format. On a miss it additionally
+    /// invokes `TdhGetEventInformation` (twice — probe then populate),
+    /// parses `TRACE_EVENT_INFO`, builds an `EventFormat` from the
+    /// property table, and inserts it into the cache.
     pub fn decode<'a>(
         &'a mut self,
-        record: &'a EVENT_RECORD) -> Result<DecodedEvent<'a>, TdhDecodeError> {
+        record: &'a EVENT_RECORD) -> Result<EventData<'a>, TdhDecodeError> {
         let key = cache_key_from_record(record);
 
         if !self.cache.contains_key(&key) {
@@ -247,13 +184,7 @@ impl TdhManifestSource {
         let schema = self.cache.get(&key).expect("schema just inserted");
         let user_data = record.user_data_slice();
 
-        resolve_fields(schema, user_data, &mut self.resolved);
-
-        Ok(DecodedEvent {
-            schema,
-            user_data,
-            resolved: &self.resolved,
-        })
+        Ok(EventData::new(user_data, user_data, &schema.format))
     }
 
     fn fetch_schema(
@@ -333,6 +264,16 @@ fn pointer_size_from_record(record: &EVENT_RECORD) -> u8 {
     }
 }
 
+/// Running state for the recursive property walk.
+struct WalkState {
+    /// Running absolute offset, used until `dynamic_seen` flips to true.
+    offset: usize,
+    /// Once any variable-length field has been emitted, all subsequent
+    /// fields must use `offset = 0` so the framework's skip-chain logic in
+    /// `try_get_field_data_closure` can resolve them at read time.
+    dynamic_seen: bool,
+}
+
 fn parse_trace_event_info(
     buffer: &[u8],
     pointer_size: u8) -> Result<CachedSchema, TdhDecodeError> {
@@ -356,7 +297,7 @@ fn parse_trace_event_info(
     }
 
     /* The EventPropertyInfoArray field is the [_; 1] tail of TRACE_EVENT_INFO;
-     * the actual array length is PropertyCount. Bounds-check it before
+     * the actual array length is PropertyCount. Bounds-check before
      * dereferencing. */
     let prop_info_offset = std::mem::offset_of!(ws_etw::TRACE_EVENT_INFO, EventPropertyInfoArray);
     let prop_info_byte_len = total_props
@@ -371,373 +312,262 @@ fn parse_trace_event_info(
             "property array extends past buffer"));
     }
 
-    let prop_info_ptr = info.EventPropertyInfoArray.as_ptr();
-    let mut properties = Vec::with_capacity(top_props);
+    let all_props: &[ws_etw::EVENT_PROPERTY_INFO] = unsafe {
+        std::slice::from_raw_parts(
+            info.EventPropertyInfoArray.as_ptr(),
+            total_props)
+    };
 
-    for i in 0..top_props {
-        /* Safety: bounds checked above. */
-        let prop = unsafe { &*prop_info_ptr.add(i) };
+    let mut format = EventFormat::new();
+    let mut state = WalkState {
+        offset: 0,
+        dynamic_seen: false,
+    };
+
+    walk_properties(
+        all_props,
+        buffer,
+        0,
+        top_props.min(total_props),
+        "",
+        &mut format,
+        &mut state,
+        pointer_size);
+
+    Ok(CachedSchema { format })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_properties(
+    all_props: &[ws_etw::EVENT_PROPERTY_INFO],
+    info_buffer: &[u8],
+    start: usize,
+    count: usize,
+    prefix: &str,
+    format: &mut EventFormat,
+    state: &mut WalkState,
+    pointer_size: u8) {
+    let end = start.saturating_add(count).min(all_props.len());
+
+    for i in start..end {
+        let prop = &all_props[i];
+
+        let raw_name = read_wide_string_at(info_buffer, prop.NameOffset as usize)
+            .unwrap_or_else(|| format!("field{}", i));
+        let name = if prefix.is_empty() {
+            raw_name
+        } else {
+            let mut combined = String::with_capacity(prefix.len() + 1 + raw_name.len());
+            combined.push_str(prefix);
+            combined.push('.');
+            combined.push_str(&raw_name);
+            combined
+        };
+
         let flags = prop.Flags;
 
-        let name = read_wide_string_at(buffer, prop.NameOffset as usize)
-            .unwrap_or_else(|| format!("field{}", i));
+        /* PropertyStruct: recurse into the struct's children, prefixing
+         * field names with the struct's name + '.'. */
+        if (flags & ws_etw::PropertyStruct) != 0 {
+            let st = unsafe { prop.Anonymous1.structType };
+            let child_start = st.StructStartIndex as usize;
+            let child_count = st.NumOfStructMembers as usize;
+            walk_properties(
+                all_props,
+                info_buffer,
+                child_start,
+                child_count,
+                &name,
+                format,
+                state,
+                pointer_size);
+            continue;
+        }
 
-        let is_struct = (flags & ws_etw::PropertyStruct) != 0;
+        /* Property shapes that the existing skip-chain cannot express
+         * today. Emit a zero-length placeholder so the schema is still
+         * cached and the rest of the event stream keeps flowing; subsequent
+         * fields will not be readable because the skip-chain has no way to
+         * advance past this. */
+        let unsupported_shape = (flags & ws_etw::PropertyParamLength) != 0
+            || (flags & ws_etw::PropertyParamCount) != 0
+            || (flags & ws_etw::PropertyParamFixedCount) != 0
+            || unsafe { prop.Anonymous2.count } > 1;
 
-        let (in_type, out_type) = if is_struct {
-            (0u16, 0u16)
-        } else {
-            /* Safety: when PropertyStruct is not set, nonStructType is the
-             * active union arm. */
-            let nst = unsafe { prop.Anonymous1.nonStructType };
-            (nst.InType, nst.OutType)
+        if unsupported_shape {
+            emit_unsupported(format, state, name);
+            continue;
+        }
+
+        let nst = unsafe { prop.Anonymous1.nonStructType };
+        let in_type = nst.InType as i32;
+        let mapping = match map_tdh_intype(in_type, pointer_size) {
+            Some(m) => m,
+            None => {
+                emit_unsupported(format, state, name);
+                continue;
+            }
         };
 
-        let count = resolve_count_spec(prop, flags);
-        let length = if is_struct {
-            LengthSpec::Unsupported
-        } else {
-            resolve_length_spec(prop, flags, in_type, pointer_size)
-        };
-
-        properties.push(PropertyDescriptor {
+        let field_offset = if state.dynamic_seen { 0 } else { state.offset };
+        format.add_field(EventField::new(
             name,
-            in_type,
-            out_type,
-            flags,
-            count,
-            length,
-            is_struct,
-        });
-    }
+            mapping.type_name.into(),
+            mapping.location,
+            field_offset,
+            mapping.size));
 
-    Ok(CachedSchema {
-        pointer_size,
-        properties,
-    })
-}
+        let is_variable = matches!(
+            mapping.location,
+            LocationType::StaticString
+                | LocationType::StaticUTF16String
+                | LocationType::StaticLenPrefixArray)
+            || mapping.size == 0;
 
-fn resolve_count_spec(
-    prop: &ws_etw::EVENT_PROPERTY_INFO,
-    flags: i32) -> CountSpec {
-    if (flags & ws_etw::PropertyParamCount) != 0 {
-        /* Count is the index of another property whose value gives the
-         * array length. */
-        let idx = unsafe { prop.Anonymous2.countPropertyIndex };
-        CountSpec::FromPropertyIndex(idx)
-    } else {
-        let count = unsafe { prop.Anonymous2.count };
-        if count <= 1 {
-            CountSpec::Single
-        } else {
-            CountSpec::Fixed(count)
+        if is_variable {
+            state.dynamic_seen = true;
+        } else if !state.dynamic_seen {
+            state.offset = state.offset.saturating_add(mapping.size);
         }
     }
 }
 
-fn resolve_length_spec(
-    prop: &ws_etw::EVENT_PROPERTY_INFO,
-    flags: i32,
-    in_type: u16,
-    pointer_size: u8) -> LengthSpec {
-    if (flags & ws_etw::PropertyParamLength) != 0 {
-        let idx = unsafe { prop.Anonymous3.lengthPropertyIndex };
-        return LengthSpec::FromPropertyIndex(idx);
-    }
+fn emit_unsupported(
+    format: &mut EventFormat,
+    state: &mut WalkState,
+    name: String) {
+    let field_offset = if state.dynamic_seen { 0 } else { state.offset };
+    format.add_field(EventField::new(
+        name,
+        "object".into(),
+        LocationType::Static,
+        field_offset,
+        0));
+    state.dynamic_seen = true;
+}
 
-    let raw_length = unsafe { prop.Anonymous3.length };
+/// Result of mapping a TDH `InType` to an `EventFormat` field description.
+struct TdhMapping {
+    type_name: &'static str,
+    size: usize,
+    location: LocationType,
+}
 
-    /* Some properties carry an explicit fixed length in `length`. For
-     * variable-length string types (`UnicodeString`, `AnsiString`),
-     * `length == 0` means NUL-terminated. */
-    match in_type as i32 {
-        ws_etw::TDH_INTYPE_INT8
-        | ws_etw::TDH_INTYPE_UINT8
-        | ws_etw::TDH_INTYPE_BOOLEAN
-        | ws_etw::TDH_INTYPE_ANSICHAR => LengthSpec::Fixed(1),
-
-        ws_etw::TDH_INTYPE_INT16
-        | ws_etw::TDH_INTYPE_UINT16
-        | ws_etw::TDH_INTYPE_UNICODECHAR => LengthSpec::Fixed(2),
-
-        ws_etw::TDH_INTYPE_INT32
-        | ws_etw::TDH_INTYPE_UINT32
-        | ws_etw::TDH_INTYPE_FLOAT
-        | ws_etw::TDH_INTYPE_HEXINT32 => LengthSpec::Fixed(4),
-
-        ws_etw::TDH_INTYPE_INT64
-        | ws_etw::TDH_INTYPE_UINT64
-        | ws_etw::TDH_INTYPE_DOUBLE
-        | ws_etw::TDH_INTYPE_HEXINT64
-        | ws_etw::TDH_INTYPE_FILETIME => LengthSpec::Fixed(8),
-
-        ws_etw::TDH_INTYPE_GUID => LengthSpec::Fixed(16),
-
-        /* SYSTEMTIME is 8 u16 fields = 16 bytes. */
-        ws_etw::TDH_INTYPE_SYSTEMTIME => LengthSpec::Fixed(16),
-
-        ws_etw::TDH_INTYPE_POINTER
-        | ws_etw::TDH_INTYPE_SIZET => LengthSpec::Fixed(pointer_size as u16),
-
-        ws_etw::TDH_INTYPE_UNICODESTRING
-        | ws_etw::TDH_INTYPE_ANSISTRING => {
-            if raw_length == 0 {
-                LengthSpec::NulTerminated
+/// Maps a TDH `InType` to the corresponding `EventFormat` field description.
+/// Returns `None` for `InType`s the current decoder cannot represent.
+fn map_tdh_intype(in_type: i32, pointer_size: u8) -> Option<TdhMapping> {
+    let m = match in_type {
+        x if x == ws_etw::TDH_INTYPE_UNICODESTRING => TdhMapping {
+            type_name: "wstring",
+            size: 0,
+            location: LocationType::StaticUTF16String,
+        },
+        x if x == ws_etw::TDH_INTYPE_ANSISTRING => TdhMapping {
+            type_name: "string",
+            size: 0,
+            location: LocationType::StaticString,
+        },
+        x if x == ws_etw::TDH_INTYPE_INT8 => TdhMapping {
+            type_name: "s8",
+            size: 1,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_UINT8
+            || x == ws_etw::TDH_INTYPE_BOOLEAN
+            || x == ws_etw::TDH_INTYPE_ANSICHAR => TdhMapping {
+            type_name: "u8",
+            size: 1,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_INT16 => TdhMapping {
+            type_name: "s16",
+            size: 2,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_UINT16
+            || x == ws_etw::TDH_INTYPE_UNICODECHAR => TdhMapping {
+            type_name: "u16",
+            size: 2,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_INT32 => TdhMapping {
+            type_name: "s32",
+            size: 4,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_UINT32
+            || x == ws_etw::TDH_INTYPE_HEXINT32 => TdhMapping {
+            type_name: "u32",
+            size: 4,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_INT64 => TdhMapping {
+            type_name: "s64",
+            size: 8,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_UINT64
+            || x == ws_etw::TDH_INTYPE_HEXINT64
+            || x == ws_etw::TDH_INTYPE_FILETIME => TdhMapping {
+            type_name: "u64",
+            size: 8,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_FLOAT => TdhMapping {
+            type_name: "u32",
+            size: 4,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_DOUBLE => TdhMapping {
+            type_name: "u64",
+            size: 8,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_GUID => TdhMapping {
+            type_name: "u8",
+            size: 16,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_SYSTEMTIME => TdhMapping {
+            type_name: "u8",
+            size: 16,
+            location: LocationType::Static,
+        },
+        x if x == ws_etw::TDH_INTYPE_POINTER
+            || x == ws_etw::TDH_INTYPE_SIZET => {
+            if pointer_size == 4 {
+                TdhMapping {
+                    type_name: "u32",
+                    size: 4,
+                    location: LocationType::Static,
+                }
             } else {
-                /* For ANSI, raw_length is bytes; for UTF-16, it is
-                 * characters → bytes = raw_length * 2. */
-                if in_type as i32 == ws_etw::TDH_INTYPE_UNICODESTRING {
-                    LengthSpec::Fixed(raw_length.saturating_mul(2))
-                } else {
-                    LengthSpec::Fixed(raw_length)
+                TdhMapping {
+                    type_name: "u64",
+                    size: 8,
+                    location: LocationType::Static,
                 }
             }
         },
-
-        ws_etw::TDH_INTYPE_NONNULLTERMINATEDSTRING => {
-            if raw_length == 0 {
-                LengthSpec::Unsupported
-            } else {
-                LengthSpec::Fixed(raw_length.saturating_mul(2))
+        x if x == ws_etw::TDH_INTYPE_COUNTEDSTRING
+            || x == ws_etw::TDH_INTYPE_COUNTEDANSISTRING
+            || x == ws_etw::TDH_INTYPE_MANIFEST_COUNTEDSTRING
+            || x == ws_etw::TDH_INTYPE_MANIFEST_COUNTEDANSISTRING
+            || x == ws_etw::TDH_INTYPE_MANIFEST_COUNTEDBINARY => {
+            /* Counted strings are wire-encoded as a u16 byte-count prefix
+             * followed by the raw bytes. The framework's skip-chain walker
+             * only pushes a field onto the skip list when `field.size == 0`,
+             * so we must emit zero here; element-size lookup at read time
+             * is driven separately by `type_name`. */
+            TdhMapping {
+                type_name: "u8",
+                size: 0,
+                location: LocationType::StaticLenPrefixArray,
             }
         },
-
-        ws_etw::TDH_INTYPE_NONNULLTERMINATEDANSISTRING => {
-            if raw_length == 0 {
-                LengthSpec::Unsupported
-            } else {
-                LengthSpec::Fixed(raw_length)
-            }
-        },
-
-        ws_etw::TDH_INTYPE_COUNTEDSTRING
-        | ws_etw::TDH_INTYPE_COUNTEDANSISTRING
-        | ws_etw::TDH_INTYPE_MANIFEST_COUNTEDSTRING
-        | ws_etw::TDH_INTYPE_MANIFEST_COUNTEDANSISTRING
-        | ws_etw::TDH_INTYPE_MANIFEST_COUNTEDBINARY => LengthSpec::CountedU16Prefix,
-
-        ws_etw::TDH_INTYPE_BINARY => {
-            if raw_length == 0 {
-                LengthSpec::Unsupported
-            } else {
-                LengthSpec::Fixed(raw_length)
-            }
-        },
-
-        ws_etw::TDH_INTYPE_SID => LengthSpec::Sid,
-
-        _ => LengthSpec::Unsupported,
-    }
-}
-
-/// Walk the cached schema against `user_data`, populating `resolved` with
-/// per-field byte ranges.
-fn resolve_fields(
-    schema: &CachedSchema,
-    user_data: &[u8],
-    resolved: &mut Vec<ResolvedField>) {
-    resolved.clear();
-    resolved.resize(
-        schema.properties.len(),
-        ResolvedField { start: 0, end: 0, status: FieldStatus::Unresolved });
-
-    let mut offset: usize = 0;
-    let mut halted = false;
-
-    for (i, prop) in schema.properties.iter().enumerate() {
-        if halted {
-            resolved[i] = ResolvedField {
-                start: 0,
-                end: 0,
-                status: FieldStatus::Unresolved,
-            };
-            continue;
-        }
-
-        if prop.is_struct {
-            /* Structs are not handled in this prototype. */
-            halted = true;
-            resolved[i] = ResolvedField {
-                start: 0,
-                end: 0,
-                status: FieldStatus::Unresolved,
-            };
-            continue;
-        }
-
-        let count = match prop.count {
-            CountSpec::Single => 1u32,
-            CountSpec::Fixed(n) => n as u32,
-            CountSpec::FromPropertyIndex(idx) => {
-                match read_field_as_u32(schema, resolved, user_data, idx as usize) {
-                    Some(v) => v,
-                    None => {
-                        halted = true;
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let field_start = offset;
-        let mut bytes_consumed: usize = 0;
-        let mut element_status = FieldStatus::Resolved;
-
-        for _ in 0..count {
-            let element_offset = field_start + bytes_consumed;
-
-            let element_len = match resolve_element_length(
-                prop,
-                schema,
-                resolved,
-                user_data,
-                element_offset) {
-                Some(len) => len,
-                None => {
-                    element_status = FieldStatus::Unresolved;
-                    break;
-                }
-            };
-
-            if element_offset + element_len > user_data.len() {
-                element_status = FieldStatus::Truncated;
-                break;
-            }
-
-            bytes_consumed += element_len;
-        }
-
-        match element_status {
-            FieldStatus::Resolved => {
-                let field_end = field_start + bytes_consumed;
-                resolved[i] = ResolvedField {
-                    start: field_start as u32,
-                    end: field_end as u32,
-                    status: FieldStatus::Resolved,
-                };
-                offset = field_end;
-            },
-            FieldStatus::Truncated => {
-                resolved[i] = ResolvedField {
-                    start: field_start as u32,
-                    end: user_data.len() as u32,
-                    status: FieldStatus::Truncated,
-                };
-                halted = true;
-            },
-            FieldStatus::Unresolved => {
-                resolved[i] = ResolvedField {
-                    start: 0,
-                    end: 0,
-                    status: FieldStatus::Unresolved,
-                };
-                halted = true;
-            },
-        }
-    }
-}
-
-fn resolve_element_length(
-    prop: &PropertyDescriptor,
-    schema: &CachedSchema,
-    resolved: &[ResolvedField],
-    user_data: &[u8],
-    element_offset: usize) -> Option<usize> {
-    match prop.length {
-        LengthSpec::Fixed(n) => Some(n as usize),
-
-        LengthSpec::FromPropertyIndex(idx) => {
-            let len = read_field_as_u32(schema, resolved, user_data, idx as usize)? as usize;
-            /* For unicode strings, length is in characters; convert to
-             * bytes. ANSI / binary stays in bytes. */
-            match prop.in_type as i32 {
-                ws_etw::TDH_INTYPE_UNICODESTRING
-                | ws_etw::TDH_INTYPE_NONNULLTERMINATEDSTRING => {
-                    Some(len.saturating_mul(2))
-                },
-                _ => Some(len),
-            }
-        },
-
-        LengthSpec::NulTerminated => {
-            if element_offset > user_data.len() {
-                return None;
-            }
-            let slice = &user_data[element_offset..];
-            match prop.in_type as i32 {
-                ws_etw::TDH_INTYPE_UNICODESTRING => {
-                    /* Count u16 code units, including the trailing NUL. */
-                    let mut len = 0usize;
-                    while len + 1 < slice.len() {
-                        let c = u16::from_le_bytes([slice[len], slice[len + 1]]);
-                        len += 2;
-                        if c == 0 { break; }
-                    }
-                    Some(len)
-                },
-                ws_etw::TDH_INTYPE_ANSISTRING => {
-                    let mut len = 0usize;
-                    while len < slice.len() {
-                        let b = slice[len];
-                        len += 1;
-                        if b == 0 { break; }
-                    }
-                    Some(len)
-                },
-                _ => None,
-            }
-        },
-
-        LengthSpec::CountedU16Prefix => {
-            if element_offset + 2 > user_data.len() {
-                return None;
-            }
-            let count = u16::from_le_bytes([
-                user_data[element_offset],
-                user_data[element_offset + 1],
-            ]) as usize;
-            Some(2 + count)
-        },
-
-        LengthSpec::Sid => {
-            /* SID layout: u8 Revision, u8 SubAuthorityCount,
-             * 6 bytes IdentifierAuthority, then SubAuthorityCount * u32. */
-            if element_offset + 8 > user_data.len() {
-                return None;
-            }
-            let sub_auth_count = user_data[element_offset + 1] as usize;
-            Some(8 + sub_auth_count * 4)
-        },
-
-        LengthSpec::Unsupported => None,
-    }
-}
-
-fn read_field_as_u32(
-    schema: &CachedSchema,
-    resolved: &[ResolvedField],
-    user_data: &[u8],
-    index: usize) -> Option<u32> {
-    if index >= resolved.len() { return None; }
-    let r = resolved[index];
-    if r.status != FieldStatus::Resolved { return None; }
-    let prop = &schema.properties[index];
-    let slice = &user_data[r.start as usize..r.end as usize];
-    match prop.in_type as i32 {
-        ws_etw::TDH_INTYPE_UINT32 | ws_etw::TDH_INTYPE_INT32 | ws_etw::TDH_INTYPE_HEXINT32 => {
-            if slice.len() < 4 { None }
-            else { Some(u32::from_le_bytes(slice[..4].try_into().ok()?)) }
-        },
-        ws_etw::TDH_INTYPE_UINT16 | ws_etw::TDH_INTYPE_INT16 => {
-            if slice.len() < 2 { None }
-            else { Some(u16::from_le_bytes(slice[..2].try_into().ok()?) as u32) }
-        },
-        ws_etw::TDH_INTYPE_UINT8 | ws_etw::TDH_INTYPE_INT8 => {
-            if slice.is_empty() { None }
-            else { Some(slice[0] as u32) }
-        },
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(m)
 }
 
 /// Read a NUL-terminated UTF-16LE string from `buffer` starting at `offset`.
@@ -762,205 +592,4 @@ fn read_wide_string_at(
     }
 
     Some(String::from_utf16_lossy(&chars))
-}
-
-/// Map a TDH `InType` value to a human-readable type name string.
-pub fn tdh_in_type_name(in_type: u16) -> &'static str {
-    match in_type as i32 {
-        ws_etw::TDH_INTYPE_UNICODESTRING => "UnicodeString",
-        ws_etw::TDH_INTYPE_ANSISTRING => "AnsiString",
-        ws_etw::TDH_INTYPE_INT8 => "i8",
-        ws_etw::TDH_INTYPE_UINT8 => "u8",
-        ws_etw::TDH_INTYPE_INT16 => "i16",
-        ws_etw::TDH_INTYPE_UINT16 => "u16",
-        ws_etw::TDH_INTYPE_INT32 => "i32",
-        ws_etw::TDH_INTYPE_UINT32 => "u32",
-        ws_etw::TDH_INTYPE_INT64 => "i64",
-        ws_etw::TDH_INTYPE_UINT64 => "u64",
-        ws_etw::TDH_INTYPE_FLOAT => "f32",
-        ws_etw::TDH_INTYPE_DOUBLE => "f64",
-        ws_etw::TDH_INTYPE_BOOLEAN => "bool",
-        ws_etw::TDH_INTYPE_BINARY => "binary",
-        ws_etw::TDH_INTYPE_GUID => "guid",
-        ws_etw::TDH_INTYPE_POINTER => "pointer",
-        ws_etw::TDH_INTYPE_FILETIME => "filetime",
-        ws_etw::TDH_INTYPE_SYSTEMTIME => "systemtime",
-        ws_etw::TDH_INTYPE_SID => "sid",
-        ws_etw::TDH_INTYPE_HEXINT32 => "hexint32",
-        ws_etw::TDH_INTYPE_HEXINT64 => "hexint64",
-        ws_etw::TDH_INTYPE_COUNTEDSTRING => "countedstring",
-        ws_etw::TDH_INTYPE_COUNTEDANSISTRING => "countedansistring",
-        ws_etw::TDH_INTYPE_NONNULLTERMINATEDSTRING => "nonnullterminatedstring",
-        ws_etw::TDH_INTYPE_NONNULLTERMINATEDANSISTRING => "nonnullterminatedansistring",
-        ws_etw::TDH_INTYPE_UNICODECHAR => "UnicodeChar",
-        ws_etw::TDH_INTYPE_ANSICHAR => "AnsiChar",
-        ws_etw::TDH_INTYPE_SIZET => "usize",
-        ws_etw::TDH_INTYPE_MANIFEST_COUNTEDSTRING => "manifest_countedstring",
-        ws_etw::TDH_INTYPE_MANIFEST_COUNTEDANSISTRING => "manifest_countedansistring",
-        ws_etw::TDH_INTYPE_MANIFEST_COUNTEDBINARY => "manifest_countedbinary",
-        _ => "unknown",
-    }
-}
-
-/// One decoded event view, borrowing from the source [`TdhManifestSource`]
-/// and the underlying [`EVENT_RECORD`].
-pub struct DecodedEvent<'a> {
-    schema: &'a CachedSchema,
-    user_data: &'a [u8],
-    resolved: &'a [ResolvedField],
-}
-
-impl<'a> DecodedEvent<'a> {
-    /// Pointer width (in bytes) used for this event's pointer-typed fields.
-    pub fn pointer_size(&self) -> u8 { self.schema.pointer_size }
-
-    /// Number of top-level properties in the schema.
-    pub fn field_count(&self) -> usize { self.schema.properties.len() }
-
-    /// Borrow the raw event payload.
-    pub fn user_data(&self) -> &'a [u8] { self.user_data }
-
-    /// Iterate over the decoded fields in declared order.
-    pub fn fields(&self) -> impl Iterator<Item = DecodedField<'_>> + '_ {
-        (0..self.schema.properties.len()).map(move |i| self.field_at(i).unwrap())
-    }
-
-    /// Look up a field by name (linear scan over the cached schema).
-    pub fn field_by_name(&self, name: &str) -> Option<DecodedField<'_>> {
-        let idx = self.schema.properties.iter().position(|p| p.name == name)?;
-        self.field_at(idx)
-    }
-
-    /// Access a field by its top-level index.
-    pub fn field_at(&self, index: usize) -> Option<DecodedField<'_>> {
-        let prop = self.schema.properties.get(index)?;
-        let r = self.resolved.get(index)?;
-        let bytes = match r.status {
-            FieldStatus::Resolved => &self.user_data[r.start as usize..r.end as usize],
-            FieldStatus::Truncated => &self.user_data[r.start as usize..r.end as usize],
-            FieldStatus::Unresolved => &[][..],
-        };
-        Some(DecodedField {
-            name: &prop.name,
-            in_type: prop.in_type,
-            out_type: prop.out_type,
-            flags: prop.flags,
-            status: r.status,
-            bytes,
-            pointer_size: self.schema.pointer_size,
-        })
-    }
-}
-
-/// View of a single decoded field within a [`DecodedEvent`].
-pub struct DecodedField<'a> {
-    pub name: &'a str,
-    pub in_type: u16,
-    pub out_type: u16,
-    pub flags: i32,
-    pub status: FieldStatus,
-    bytes: &'a [u8],
-    pointer_size: u8,
-}
-
-impl<'a> DecodedField<'a> {
-    /// Raw payload bytes for this field. Empty if [`FieldStatus::Unresolved`].
-    pub fn bytes(&self) -> &'a [u8] { self.bytes }
-
-    /// Pointer width in bytes (4 or 8) for pointer-typed fields.
-    pub fn pointer_size(&self) -> u8 { self.pointer_size }
-
-    /// Try to interpret the field as a `u32`. Works for `UInt32`, `Int32`,
-    /// `HexInt32`, and (zero-extended) `UInt16`/`UInt8` variants.
-    pub fn as_u32(&self) -> Option<u32> {
-        match self.in_type as i32 {
-            ws_etw::TDH_INTYPE_UINT32 | ws_etw::TDH_INTYPE_INT32 | ws_etw::TDH_INTYPE_HEXINT32 => {
-                if self.bytes.len() < 4 { None }
-                else { Some(u32::from_le_bytes(self.bytes[..4].try_into().ok()?)) }
-            },
-            ws_etw::TDH_INTYPE_UINT16 | ws_etw::TDH_INTYPE_INT16 => {
-                if self.bytes.len() < 2 { None }
-                else { Some(u16::from_le_bytes(self.bytes[..2].try_into().ok()?) as u32) }
-            },
-            ws_etw::TDH_INTYPE_UINT8 | ws_etw::TDH_INTYPE_INT8 | ws_etw::TDH_INTYPE_BOOLEAN => {
-                if self.bytes.is_empty() { None } else { Some(self.bytes[0] as u32) }
-            },
-            _ => None,
-        }
-    }
-
-    /// Try to interpret the field as a `u64`. Works for `UInt64`, `Int64`,
-    /// `HexInt64`, `FILETIME`, `Pointer`/`SizeT` (4- or 8-byte).
-    pub fn as_u64(&self) -> Option<u64> {
-        match self.in_type as i32 {
-            ws_etw::TDH_INTYPE_UINT64
-            | ws_etw::TDH_INTYPE_INT64
-            | ws_etw::TDH_INTYPE_HEXINT64
-            | ws_etw::TDH_INTYPE_FILETIME => {
-                if self.bytes.len() < 8 { None }
-                else { Some(u64::from_le_bytes(self.bytes[..8].try_into().ok()?)) }
-            },
-            ws_etw::TDH_INTYPE_POINTER | ws_etw::TDH_INTYPE_SIZET => {
-                match self.pointer_size {
-                    8 => {
-                        if self.bytes.len() < 8 { None }
-                        else { Some(u64::from_le_bytes(self.bytes[..8].try_into().ok()?)) }
-                    },
-                    4 => {
-                        if self.bytes.len() < 4 { None }
-                        else {
-                            let v = u32::from_le_bytes(self.bytes[..4].try_into().ok()?);
-                            Some(v as u64)
-                        }
-                    },
-                    _ => None,
-                }
-            },
-            _ => self.as_u32().map(|v| v as u64),
-        }
-    }
-
-    /// Try to render the field as a `String`. Handles the string-shaped
-    /// `InType`s (with or without length prefix / NUL terminator).
-    pub fn as_string(&self) -> Option<String> {
-        match self.in_type as i32 {
-            ws_etw::TDH_INTYPE_UNICODESTRING
-            | ws_etw::TDH_INTYPE_NONNULLTERMINATEDSTRING => {
-                Some(decode_utf16_lossy(self.bytes))
-            },
-            ws_etw::TDH_INTYPE_ANSISTRING
-            | ws_etw::TDH_INTYPE_NONNULLTERMINATEDANSISTRING => {
-                Some(decode_ansi_lossy(self.bytes))
-            },
-            ws_etw::TDH_INTYPE_COUNTEDSTRING
-            | ws_etw::TDH_INTYPE_MANIFEST_COUNTEDSTRING => {
-                /* Skip the u16 length prefix. */
-                if self.bytes.len() < 2 { return None; }
-                Some(decode_utf16_lossy(&self.bytes[2..]))
-            },
-            ws_etw::TDH_INTYPE_COUNTEDANSISTRING
-            | ws_etw::TDH_INTYPE_MANIFEST_COUNTEDANSISTRING => {
-                if self.bytes.len() < 2 { return None; }
-                Some(decode_ansi_lossy(&self.bytes[2..]))
-            },
-            _ => None,
-        }
-    }
-}
-
-fn decode_utf16_lossy(bytes: &[u8]) -> String {
-    let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let c = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-        if c == 0 { break; }
-        units.push(c);
-        i += 2;
-    }
-    String::from_utf16_lossy(&units)
-}
-
-fn decode_ansi_lossy(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }

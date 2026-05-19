@@ -4,26 +4,25 @@
 //! Example: dynamic per-provider TDH decoding.
 //!
 //! Records every event from a single ETW provider for a few seconds, decodes
-//! each event's schema and per-field offsets on the fly via
-//! `TdhManifestSource`, and prints decoded values.
+//! each event via `TdhDecoder`, and prints field values via the
+//! standard `EventFormat` / `EventData` accessors.
 //!
 //! Usage:
 //!     cargo run --example etw_dynamic --target x86_64-pc-windows-msvc -- <provider-guid>
 //!
 //! Default provider is Microsoft-Windows-Kernel-Process
-//! (22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716), which exercises pointer-,
-//! integer-, SID-, AnsiString- and UnicodeString-typed fields in its
-//! ProcessStart event.
+//! (22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716).
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use std::env;
 
+    use one_collect::event::{EventData, EventFormat, LocationType};
     use one_collect::event::Event;
     use one_collect::etw::{
         EtwSession,
         LEVEL_VERBOSE,
-        tdh::{TdhManifestSource, FieldStatus, tdh_in_type_name},
+        tdh::TdhDecoder,
     };
 
     let args: Vec<String> = env::args().collect();
@@ -45,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     *event.extension_mut().keyword_mut() = 0;
 
     /* Owned by the closure; the cache lives as long as the callback. */
-    let mut tdh = TdhManifestSource::new();
+    let mut tdh = TdhDecoder::new();
 
     event.add_callback(move |_data| {
         let ancillary = ancillary.borrow();
@@ -57,31 +56,22 @@ fn main() -> anyhow::Result<()> {
         let id = record.EventHeader.EventDescriptor.Id;
         let opcode = record.EventHeader.EventDescriptor.Opcode;
 
-        let mut summary = String::new();
+        let mut summary;
         let mut field_lines = String::new();
 
         match tdh.decode(record) {
             Ok(decoded) => {
                 summary = format!(
-                    "event id={} opcode={} ptr={}b fields={}",
+                    "event id={} opcode={} fields={}",
                     id,
                     opcode,
-                    decoded.pointer_size(),
-                    decoded.field_count());
+                    decoded.format().fields().len());
 
-                for field in decoded.fields() {
-                    let value_repr = render_value(&field);
-                    let status_tag = match field.status {
-                        FieldStatus::Resolved => "",
-                        FieldStatus::Truncated => " [truncated]",
-                        FieldStatus::Unresolved => " [unresolved]",
-                    };
+                for field in decoded.format().fields() {
+                    let rendered = render_field(&decoded, field);
                     field_lines.push_str(&format!(
-                        "  {} : {}{} = {}\n",
-                        field.name,
-                        tdh_in_type_name(field.in_type),
-                        status_tag,
-                        value_repr));
+                        "  {} : {} = {}\n",
+                        field.name, field.type_name, rendered));
                 }
             },
             Err(e) => {
@@ -103,44 +93,118 @@ fn main() -> anyhow::Result<()> {
 
     session.parse_for_duration(
         "one_collect-etw-tdh-example",
-        std::time::Duration::from_secs(5))?;
+        std::time::Duration::from_secs(15))?;
 
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn render_value(field: &one_collect::etw::tdh::DecodedField<'_>) -> String {
-    use one_collect::etw::tdh::FieldStatus;
+fn render_field(
+    data: &one_collect::event::EventData<'_>,
+    field: &one_collect::event::EventField) -> String {
+    use one_collect::event::LocationType;
 
-    if field.status == FieldStatus::Unresolved {
-        return "<unresolved>".into();
-    }
+    /* Use the framework's skip-chain to extract the slice. */
+    let mut closure = match data.format().try_get_field_data_closure(&field.name) {
+        Some(c) => c,
+        None => return "<closure unavailable>".into(),
+    };
+    let bytes = closure(data.event_data());
 
-    if let Some(s) = field.as_string() {
-        return format!("\"{}\"", s);
-    }
-
-    if let Some(v) = field.as_u64() {
-        return format!("{} (0x{:x})", v, v);
-    }
-
-    if let Some(v) = field.as_u32() {
-        return format!("{} (0x{:x})", v, v);
-    }
-
-    let bytes = field.bytes();
     if bytes.is_empty() {
         return "<empty>".into();
     }
 
-    /* Hex-dump short blobs. */
+    match field.location {
+        LocationType::StaticUTF16String => {
+            let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
+            let mut i = 0;
+            while i + 1 < bytes.len() {
+                let c = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+                if c == 0 { break; }
+                units.push(c);
+                i += 2;
+            }
+            format!("\"{}\"", String::from_utf16_lossy(&units))
+        },
+        LocationType::StaticString => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            format!("\"{}\"", String::from_utf8_lossy(&bytes[..end]))
+        },
+        LocationType::StaticLenPrefixArray => {
+            /* TraceLogging `str8` is UTF-8 with a u16 byte-count prefix.
+             * Try UTF-8 first (most common); fall back to UTF-16; then
+             * fall back to hex if neither looks textual. */
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                if !s.is_empty() && s.chars().all(|c| c == '\n' || c == '\r' || c == '\t' || !c.is_control()) {
+                    return format!("\"{}\"", s);
+                }
+            }
+            if bytes.len() >= 2 && bytes.len() % 2 == 0 {
+                let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
+                let mut i = 0;
+                let mut printable = true;
+                while i + 1 < bytes.len() {
+                    let c = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+                    if c != 0 && (c < 0x20 || c > 0xFFFD) {
+                        printable = false;
+                        break;
+                    }
+                    units.push(c);
+                    i += 2;
+                }
+                if printable && !units.is_empty() {
+                    return format!("\"{}\"", String::from_utf16_lossy(&units));
+                }
+            }
+            hex_preview(bytes)
+        },
+        LocationType::Static => {
+            match field.type_name.as_str() {
+                "u8" => {
+                    if field.size == 1 {
+                        format!("{}", bytes[0])
+                    } else {
+                        hex_preview(bytes)
+                    }
+                },
+                "s8" => format!("{}", bytes[0] as i8),
+                "u16" if bytes.len() >= 2 => {
+                    let v = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    format!("{} (0x{:x})", v, v)
+                },
+                "s16" if bytes.len() >= 2 => {
+                    format!("{}", i16::from_le_bytes([bytes[0], bytes[1]]))
+                },
+                "u32" if bytes.len() >= 4 => {
+                    let v = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                    format!("{} (0x{:x})", v, v)
+                },
+                "s32" if bytes.len() >= 4 => {
+                    format!("{}", i32::from_le_bytes(bytes[..4].try_into().unwrap()))
+                },
+                "u64" if bytes.len() >= 8 => {
+                    let v = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                    format!("{} (0x{:x})", v, v)
+                },
+                "s64" if bytes.len() >= 8 => {
+                    format!("{}", i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+                },
+                _ => hex_preview(bytes),
+            }
+        },
+        _ => hex_preview(bytes),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn hex_preview(bytes: &[u8]) -> String {
     let preview: String = bytes
         .iter()
         .take(16)
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join(" ");
-
     if bytes.len() > 16 {
         format!("{} bytes: {}...", bytes.len(), preview)
     } else {
