@@ -60,23 +60,15 @@ impl AncillaryData {
         self.cpu
     }
 
-    pub fn config(&self) -> u64 {
+    pub(crate) fn config(&self) -> u64 {
         self.attributes.config
     }
 
-    pub fn event_type(&self) -> u32 {
+    pub(crate) fn event_type(&self) -> u32 {
         self.attributes.event_type
     }
 
-    pub fn sample_type(&self) -> u64 {
-        self.attributes.sample_type
-    }
-
-    pub fn read_format(&self) -> u64 {
-        self.attributes.read_format
-    }
-
-    pub fn non_sampled_id_offsets(&self) -> Option<SampleIdOffsets> {
+    pub(crate) fn non_sampled_id_offsets(&self) -> Option<SampleIdOffsets> {
         self.attributes.non_sampled_id_offsets()
     }
 }
@@ -90,9 +82,9 @@ impl Clone for AncillaryData {
     }
 }
 
-pub struct PerfData<'a> {
-    pub ancillary: AncillaryData,
-    pub raw_data: &'a [u8],
+pub(crate) struct PerfData<'a> {
+    pub(crate) ancillary: AncillaryData,
+    pub(crate) raw_data: &'a [u8],
 }
 
 impl<'a> Default for PerfData<'a> {
@@ -176,13 +168,13 @@ impl<'a> PerfData<'a> {
     }
 }
 
-pub struct PerfDataFile {
+pub(crate) struct PerfDataFile {
     id: u64,
     fd: i32,
 }
 
 impl PerfDataFile {
-    pub fn new(
+    pub(crate) fn new(
         id: u64,
         fd: i32) -> Self {
         Self {
@@ -191,12 +183,12 @@ impl PerfDataFile {
         }
     }
 
-    pub fn id(&self) -> u64 { self.id }
+    pub(crate) fn id(&self) -> u64 { self.id }
 
-    pub fn fd(&self) -> i32 { self.fd }
+    pub(crate) fn fd(&self) -> i32 { self.fd }
 }
 
-pub trait PerfDataSource {
+pub(crate) trait PerfDataSource {
     fn enable(&mut self) -> IOResult<()>;
 
     fn disable(&mut self) -> IOResult<()>;
@@ -300,7 +292,7 @@ impl Drop for PerfSession {
 }
 
 impl PerfSession {
-    pub fn new(
+    pub(crate) fn new(
         source: Box<dyn PerfDataSource>) -> Self {
         debug!("PerfSession::new: creating new PerfSession");
 
@@ -558,7 +550,7 @@ impl PerfSession {
         &mut self.capture_env_options
     }
 
-    pub fn create_bpf_files(
+    pub(crate) fn create_bpf_files(
         &mut self,
         event: Option<&Event>) -> IOResult<Vec<PerfDataFile>> {
         self.source.create_bpf_files(event)
