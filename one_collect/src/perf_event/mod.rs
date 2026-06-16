@@ -60,15 +60,23 @@ impl AncillaryData {
         self.cpu
     }
 
-    pub(crate) fn config(&self) -> u64 {
+    pub fn config(&self) -> u64 {
         self.attributes.config
     }
 
-    pub(crate) fn event_type(&self) -> u32 {
+    pub fn event_type(&self) -> u32 {
         self.attributes.event_type
     }
 
-    pub(crate) fn non_sampled_id_offsets(&self) -> Option<SampleIdOffsets> {
+    pub fn sample_type(&self) -> u64 {
+        self.attributes.sample_type
+    }
+
+    pub fn read_format(&self) -> u64 {
+        self.attributes.read_format
+    }
+
+    pub fn non_sampled_id_offsets(&self) -> Option<SampleIdOffsets> {
         self.attributes.non_sampled_id_offsets()
     }
 }
