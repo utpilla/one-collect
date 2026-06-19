@@ -884,6 +884,67 @@ pub(crate) fn flush_trace(handle: u64) {
     }
 }
 
+/// Live health/loss counters for a running ETW session, read via
+/// [`query_trace`]. All values are cumulative since the session started.
+///
+/// These counters are session-wide: they cannot be attributed to a specific
+/// provider or event, because the dropped events were never recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceStats {
+    /// Individual events the kernel dropped at write time because every
+    /// buffer was full and the pool was already at `MaximumBuffers`
+    /// (producer-side loss).
+    pub events_lost: u64,
+
+    /// Whole buffers dropped because the real-time consumer could not drain
+    /// them fast enough and the kernel's delivery queue overflowed
+    /// (consumer-side loss; each lost buffer is many events).
+    pub real_time_buffers_lost: u64,
+
+    /// Whole buffers that could not be flushed to a log file. Effectively
+    /// zero for real-time (non-file) sessions; included for completeness.
+    pub log_buffers_lost: u64,
+
+    /// Total buffers written by the session. Not a loss metric; useful as a
+    /// denominator for computing a loss rate.
+    pub buffers_written: u64,
+}
+
+/// Query a running session's live statistics counters by handle. Mirrors
+/// [`flush_trace`], but drives `ControlTraceW` with the QUERY control code,
+/// which populates the loss/health counters in `EVENT_TRACE_PROPERTIES`.
+///
+/// `EVENT_TRACE_CONTROL_QUERY` is imported from `windows-sys` rather than
+/// hand-defined (unlike the STOP/FLUSH codes above), reusing the crate's
+/// existing dependency instead of adding another local constant.
+///
+/// The handle is a bare `u64`, so this is safe to call from any thread,
+/// including a poller separate from the `ProcessTrace` consumer.
+pub(crate) fn query_trace(handle: u64) -> anyhow::Result<TraceStats> {
+    use windows_sys::Win32::System::Diagnostics::Etw::EVENT_TRACE_CONTROL_QUERY;
+
+    let mut properties = EVENT_TRACE_PROPERTIES::for_control();
+
+    let result = unsafe {
+        ControlTraceW(
+            handle,
+            std::ptr::null(),
+            &mut properties,
+            EVENT_TRACE_CONTROL_QUERY)
+    };
+
+    if result != 0 {
+        anyhow::bail!("ControlTraceW(QUERY) failed with {}", result);
+    }
+
+    Ok(TraceStats {
+        events_lost: properties.EventsLost as u64,
+        real_time_buffers_lost: properties.RealTimeBuffersLost as u64,
+        log_buffers_lost: properties.LogBuffersLost as u64,
+        buffers_written: properties.BuffersWritten as u64,
+    })
+}
+
 pub(super) struct TraceSession {
     properties: EVENT_TRACE_PROPERTIES,
     name: String,

@@ -26,6 +26,8 @@ use abi::{
     EventRecordExt,
 };
 
+pub use abi::TraceStats;
+
 pub const PROPERTY_ENABLE_KEYWORD_0: u32 = abi::EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0;
 pub const PROPERTY_ENABLE_SILOS: u32 = abi::EVENT_ENABLE_PROPERTY_ENABLE_SILOS;
 pub const PROPERTY_EVENT_KEY: u32 = abi::EVENT_ENABLE_PROPERTY_EVENT_KEY;
@@ -276,9 +278,37 @@ impl SessionCallbackContext {
 
     pub fn id(&self) -> u64 { self.id }
 
+    /// The raw ETW session handle. It is a plain `u64` and is `Send`, so it
+    /// can be captured (e.g. into an `AtomicU64`) and used to query session
+    /// statistics from another thread via the free [`query_stats`] function.
+    pub fn handle(&self) -> u64 { self.handle }
+
+    /// Query the session's live loss/health counters (events lost, real-time
+    /// buffers lost, etc.). See [`TraceStats`]. Returns an error if the
+    /// underlying `ControlTraceW(QUERY)` call fails.
+    pub fn query_stats(&self) -> anyhow::Result<TraceStats> {
+        abi::query_trace(self.handle)
+    }
+
     pub fn flush_trace(&self) {
         abi::flush_trace(self.handle);
     }
+}
+
+/// Query a running ETW session's live loss/health counters by its raw
+/// handle (obtained from [`SessionCallbackContext::handle`]). See
+/// [`TraceStats`].
+///
+/// The handle is a plain `u64` and is `Send`, so this can be called from
+/// any thread - including a poller separate from the blocking
+/// `parse_until` consumer. This is the intended way to sample loss
+/// metrics for a long-running session that never stops on its own.
+///
+/// Returns an error if the underlying `ControlTraceW(QUERY)` call fails
+/// (for example, if the session has already stopped and the handle is no
+/// longer valid).
+pub fn query_stats(handle: u64) -> anyhow::Result<TraceStats> {
+    abi::query_trace(handle)
 }
 
 type SendClosure = Box<dyn Fn(&SessionCallbackContext) + Send + 'static>;
